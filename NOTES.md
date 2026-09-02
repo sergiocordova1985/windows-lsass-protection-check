@@ -1,0 +1,62 @@
+# windows-lsass-protection-check
+
+A PowerShell toolkit for auditing whether [LSASS](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Local%20Security%20Authority%20Subsystem%20Service%20%28LSASS%29.md) is actually protected on a Windows machine — configuration checks for LSA Protection and Credential Guard, plus a Sysmon-based detector that catches the real attack primitive (`PROCESS_VM_READ` [handle](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Handle%20Table%20%28Windows%29.md) opens against `lsass.exe`) in the act, not just its configuration prerequisites.
+
+## Why LSASS protection matters to a defender
+
+[LSASS](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Local%20Security%20Authority%20Subsystem%20Service%20%28LSASS%29.md) holds live credential material in memory — password hashes, Kerberos tickets, cached logon secrets — because it's the process actually responsible for authenticating logons. [Credential theft](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Credential%20Theft.md) via LSASS memory dumping is [MITRE ATT&CK T1003.001](https://attack.mitre.org/techniques/T1003/001/), and [Mimikatz](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Mimikatz.md) is the canonical tool for it — but the underlying mechanism is nothing exotic: `OpenProcess` requesting `PROCESS_VM_READ` against `lsass.exe`'s PID, using whatever [access token](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Access%20Token%20%28Windows%29.md) privileges the caller already holds. Windows ships two independent mitigations for this — LSA Protection (running LSASS as a Protected Process Light) and Credential Guard (isolating secrets in a VBS-protected enclave the OS itself can't read) — but a mitigation that's silently misconfigured or reverted protects nothing. This toolkit checks both, and then goes one step further: it watches for the actual attack technique happening, independent of whether the config-level mitigations are in place.
+
+_Grounded in a hands-on Windows hardening lab that covers T1003.001/Mimikatz directly and whose reading list points at the Microsoft LSA-protection documentation this repo's first component is built from._
+
+## Components
+
+### `Get-LsaProtectionStatus` — `RunAsPPL` + WinInit Event ID 12 cross-check
+
+Reads the `RunAsPPL` registry value (`HKLM:\SYSTEM\CurrentControlSet\Control\Lsa`) to determine *configured* intent (`Disabled` / `EnabledWithUefiLock` / `EnabledWithoutUefiLock`), then cross-checks it against the WinInit Event ID 12 log entry that Windows writes at boot to confirm LSASS actually *started* as a Protected Process — the same two-signal pattern `Get-BootIntegrityAudit` in the sibling `windows-boot-integrity-audit` repo uses (registry says one thing, runtime evidence says another, and a real mismatch is more interesting than either signal alone).
+
+**Real bugs found and fixed:** the event filter originally targeted `Provider[@Name='Wininit']` — the real provider name is `Microsoft-Windows-Wininit`, found by broadening the search to match on message text instead of guessing. Second: `Get-WinEvent -MaxEvents 1` with no time bound returns the most recent matching event in the log's *entire history*, not "did this happen this boot" — a leftover Event 12 from a previous `Protected` boot kept making a freshly-`Disabled` VM report as `Mismatch`. Fixed by comparing the event's timestamp against `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime`. Both `Disabled` and `Protected` branches proven for real by flipping `RunAsPPL` and rebooting the target VM each time.
+
+### `Get-CredentialGuardStatus` — `Win32_DeviceGuard`, configured vs. running
+
+Queries `Win32_DeviceGuard` (`root\Microsoft\Windows\DeviceGuard` namespace) for `SecurityServicesConfigured` vs. `SecurityServicesRunning`, the same configured-vs-actual pattern as the LSA Protection component.
+
+**Real bug found and fixed:** `Get-CimInstance`'s returned object can't deserialize back across PowerShell remoting on a Linux/snap `pwsh` controller (missing `libmi.so`) — even though the query itself runs remotely on the Windows target, the CIM-typed result crossing back to the Linux client is what breaks. Fixed by converting to `[PSCustomObject]` *inside* the remote script block, before anything CIM-typed has to survive the trip back.
+
+**Real infrastructure limit hit and recovered from, not just documented as untested:** attempting to prove the `Enabled` branch for real meant enabling [Virtualization Based Security](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Hardware-Assisted%20Virtualization.md) on a UEFI-cloned VM — nested virtualization turned on, VBS registry keys set, rebooted. The VM hung reproducibly at the identical point in `VBox.log` on two consecutive boots: VBS spins up its own nested Secure Kernel hypervisor inside a guest that's *already* running nested under VirtualBox's own hypervisor — triple-nested virtualization, a genuine ceiling VirtualBox doesn't reliably support, not a config mistake. Two failed boots auto-triggered Windows' WinRE recovery screen; recovered without re-cloning by navigating to a WinRE command prompt, using `diskpart` to find the real OS volume (not the 100 MB decoy `C:`), loading the offline `SYSTEM` hive with `reg load`, confirming the active control set (`Select\Current`), deleting the three VBS/Credential Guard registry values added during setup, and rebooting clean — VM came back to the exact pre-experiment baseline. The `Enabled` branch is left honestly undocumented, same treatment as `windows-boot-integrity-audit`'s Secure Boot `Enabled` branch — but backed by a real, reproduced attempt and a named root cause this time, not just absent hardware.
+
+### `Get-LsassAccessAudit` — Sysmon-based `PROCESS_VM_READ` detection
+
+The component that actually watches for the attack, not just its prerequisites. Installs and configures [Sysmon](https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon) with a config scoped to `ProcessAccess` (Event ID 10) where `TargetImage` ends in `lsass.exe` — Sysmon doesn't log ProcessAccess at all by default (too noisy system-wide), so this scoping is what makes the signal usable. The detector pulls matching events over a configurable lookback window, parses the `GrantedAccess` [access mask](https://github.com/sergiocordova1985/cybersecurity-vault/blob/main/Memory%20Protection%20Constants%20%28Win32%20API%29.md) hex string, bitwise-tests for `PROCESS_VM_READ` (`0x0010`), and flags any hit from a `SourceImage` outside a whitelist of known-legitimate system processes.
+
+**Real infrastructure bug, not a design flaw:** copying Sysmon to the target VM (which has no internet route on its host-only network) via `scp` failed with `subsystem request failed on channel 0` — modern OpenSSH clients default to the SFTP protocol, and Windows OpenSSH Server on the target doesn't have the `sftp-server` subsystem enabled. Fixed with `scp -O`, forcing the legacy SCP protocol.
+
+**Real finding about Sysmon itself:** any event type without an explicit rule in the config (e.g. `ProcessCreate`) gets logged completely unfiltered by default — only types with an explicit rule are scoped. `ProcessAccess` stayed correctly restricted to `lsass.exe` targets throughout, confirmed against real background traffic from `svchost.exe` and `VBoxService.exe`.
+
+**A genuine Win32 API trap, chased and ruled out:** building a benign trigger (raw `OpenProcess` via P/Invoke, `PROCESS_VM_READ`, immediate `CloseHandle` — no memory read or dump, consistent with this portfolio's defensive-only scope) first failed with Access Denied. The instinct was a missing `SeDebugPrivilege`, and `AdjustTokenPrivileges` returned `TRUE` when called to enable it — but `whoami /priv` proved the whole branch was a dead end: the session already had `SeDebugPrivilege` `Enabled` by default. `AdjustTokenPrivileges` returning success does **not** mean a privilege was actually granted — the real signal is `GetLastError()` called immediately afterward, which returned `1300` (`ERROR_NOT_ALL_ASSIGNED`) even on the `TRUE`-returning call. A wrong theory (UAC remote token filtering) got chased first and ruled out with `whoami /user` before the real one surfaced.
+
+**The real blocker, and the finding that actually matters:** with `SeDebugPrivilege` already active, `OpenProcess` still failed. `RunAsPPL` was still `1` (Protected) on the target, left over from testing the first component. Windows enforces protection-level comparison inside `OpenProcess` itself — a normal-integrity caller cannot get `PROCESS_VM_READ` against a Protected Process Light target *no matter what privileges it holds*. Proving the attack path this component is built to detect required deliberately reproducing the exact "LSASS unprotected" condition `Get-LsaProtectionStatus` exists to catch — the two components validate each other. Set `RunAsPPL=0`, rebooted, and the same `OpenProcess` call succeeded immediately.
+
+**Detection proven for real, twice:** with PPL off, `GrantedAccess: 0x10` from `pwsh.exe` against `lsass.exe`'s real PID showed up in the Sysmon log exactly as designed. `Get-LsassAccessAudit` correctly classified it `Attention`, 2-for-2 real `PROCESS_VM_READ` attempts flagged, zero false positives across roughly a hundred benign `ProcessAccess` events scanned in the same window.
+
+**Bonus validation the whitelist works both ways:** after restoring `RunAsPPL=1` and rebooting, a fresh audit run caught `csrss.exe` and `wininit.exe` requesting `PROCESS_VM_READ` against `lsass.exe` at the exact reboot timestamp — genuinely legitimate traffic (Windows' own machinery setting up LSASS as a Protected Process at boot), correctly whitelisted, zero false-positive noise. A naive "any `VM_READ` = alert" rule with no whitelist would have false-fired on completely normal Windows startup every single time.
+
+### `Invoke-LsassProtectionAudit` — unified entry point
+
+Runs all three components against one machine, same `Pass`/`Attention`/`Unreachable` pattern as `windows-boot-integrity-audit`'s `Invoke-BootIntegrityAudit`:
+
+```powershell
+$fleet = @('192.168.1.50', '192.168.1.51', '192.168.1.52')
+$fleet | ForEach-Object { Invoke-LsassProtectionAudit -ComputerName $_ } |
+    Where-Object { $_.OverallStatus -ne 'Pass' }
+```
+
+A real end-to-end run against the lab target after restoring its baseline produced exactly the expected mixed result: `LsaProtection: Protected` (rollback confirmed), `CredentialGuard: Disabled` (an honest, pre-documented environment limitation, not a bug), and `AccessAudit: Attention` correctly surfacing both the legitimate boot-time `csrss`/`wininit` traffic and the earlier test's `pwsh.exe` alert, still inside the default 60-minute lookback — the right behavior for a detective control, which reports real recent history rather than only reflecting current configuration.
+
+## Design note: SSH, not WinRM
+
+Same environment and same trade-off as `windows-boot-integrity-audit`: the controller is `pwsh` running on Ubuntu, `Invoke-Command -SSHTransport` reaches the Windows target where Windows-specific functionality (Sysmon, `Win32_DeviceGuard`, the raw Win32 API calls this repo's detector trigger uses) actually has to run. Passwordless access uses the same dedicated ed25519 keypair setup as the sibling repo.
+
+## Takeaway
+
+Almost everything that makes this toolkit trustworthy came from a chain of real dead ends, not from the original design working on the first try. `AdjustTokenPrivileges` returning `TRUE` looked like success — it wasn't, and only `GetLastError()` immediately after the call told the truth. A UAC token-filtering theory looked plausible — it wasn't, and `whoami /user`/`whoami /priv` ruled it out before any code got rewritten to chase it. The real blocker turned out to be the *other* component in this same repo: LSA Protection, working exactly as intended, refusing even a fully-privileged caller access to a Protected Process. That's not a coincidence to gloss over — it's the strongest evidence in this whole repo that Component 1 actually does what it claims, discovered by accident while trying to prove Component 3 does what *it* claims. Two independently-built detectors ended up validating each other for free, which is a better argument for building the full defensive stack than a coincidence.
+
